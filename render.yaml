@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: docu-bounds-detector
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    plan: free
+    region: frankfurt
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
