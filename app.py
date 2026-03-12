@@ -269,9 +269,44 @@ def detect():
             return jsonify({'error': 'imageBase64 не передан'}), 400
         
         image_base64 = data['imageBase64']
-        
-        # Детекция границ
-        result = detect_with_projection(image_base64)
+
+        # --- Комбинированная детекция ---
+        # 1) По контурам документа
+        bounds_by_contour = detect_document_bounds(image_base64)
+
+        # 2) По линиям текста (если возможно)
+        bounds_by_text = detect_with_projection(image_base64)
+
+        # Базовый результат — по контурам
+        result = bounds_by_contour.copy()
+
+        # Если метод по тексту дал разумный результат — аккуратно смешиваем
+        try:
+            ow = bounds_by_contour.get('originalWidth', bounds_by_text.get('originalWidth'))
+            oh = bounds_by_contour.get('originalHeight', bounds_by_text.get('originalHeight'))
+
+            area_img = max(1, ow * oh)
+            area_contour = max(1, bounds_by_contour['cropWidth'] * bounds_by_contour['cropHeight'])
+            area_text = max(1, bounds_by_text['cropWidth'] * bounds_by_text['cropHeight'])
+
+            ratio_contour = area_contour / area_img
+            ratio_text = area_text / area_img
+
+            # Берём угол по тексту, если он есть и не "сумасшедший"
+            rot_text = bounds_by_text.get('rotation', 0)
+            if abs(rot_text) <= 30 and abs(rot_text) >= 0.3:
+                result['rotation'] = rot_text
+
+            # Если область по тексту не слишком маленькая и не слишком большая — используем её
+            # (например, 10%–90% площади изображения)
+            if 0.1 <= ratio_text <= 0.9:
+                result['cropX'] = bounds_by_text['cropX']
+                result['cropY'] = bounds_by_text['cropY']
+                result['cropWidth'] = bounds_by_text['cropWidth']
+                result['cropHeight'] = bounds_by_text['cropHeight']
+        except Exception:
+            # В случае любой ошибки просто возвращаем вариант по контурам
+            result = bounds_by_contour
         
         return jsonify(result)
     
