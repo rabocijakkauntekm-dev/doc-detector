@@ -4,8 +4,50 @@ import numpy as np
 import base64
 from PIL import Image
 import io
+import math
 
 app = Flask(__name__)
+
+
+def order_points(pts):
+    """
+    Сортирует 4 точки в порядке: верхний-левый, верхний-правый, нижний-правый, нижний-левый
+    """
+    rect = np.zeros((4, 2), dtype="float32")
+    
+    # Сортировка по сумме координат (верхний-левый имеет минимальную сумму, нижний-правый - максимальную)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # верхний-левый
+    rect[2] = pts[np.argmax(s)]  # нижний-правый
+    
+    # Сортировка по разности координат (верхний-правый имеет минимальную разность, нижний-левый - максимальную)
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # верхний-правый
+    rect[3] = pts[np.argmax(diff)]  # нижний-левый
+    
+    return rect
+
+
+def calculate_angle(pts):
+    """
+    Вычисляет угол поворота документа по верхней грани.
+    Возвращает угол в градусах (положительный = поворот по часовой стрелке).
+    """
+    # Верхняя грань: от верхнего-левого к верхнему-правому
+    top_left = pts[0]
+    top_right = pts[1]
+    
+    dx = top_right[0] - top_left[0]
+    dy = top_right[1] - top_left[1]
+    
+    # Вычисляем угол в градусах
+    angle = math.degrees(math.atan2(dy, dx))
+    
+    # Нормализуем: если угол > 45°, значит документ повёрнут на 90°
+    if abs(angle) > 45:
+        angle = angle - 90 if angle > 0 else angle + 90
+    
+    return round(angle, 2)
 
 
 def detect_document_bounds(image_base64):
@@ -127,6 +169,10 @@ def detect_with_projection(image_base64):
     # Конвертируем в оттенки серого
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
+    # Адаптивная бинаризация (лучше для документов)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                    cv2.THRESH_BINARY, 11, 2)
+    
     # Размытие
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
@@ -151,16 +197,15 @@ def detect_with_projection(image_base64):
             break
     
     if doc_contour is not None:
-        # Сортируем точки: верхний-левый, верхний-правый, нижний-правый, нижний-левый
+        # Сортируем точки правильно
         pts = doc_contour.reshape(4, 2)
+        ordered_pts = order_points(pts)
         
         # Находим ограничивающий прямоугольник
         x, y, w, h = cv2.boundingRect(doc_contour)
         
-        # Вычисляем угол поворота по первой стороне
-        dx = pts[1][0] - pts[0][0]
-        dy = pts[1][1] - pts[0][1]
-        rotation = np.degrees(np.arctan2(dy, dx))
+        # Вычисляем угол поворота по верхней грани
+        rotation = calculate_angle(ordered_pts)
         
         padding = 10
         crop_x = max(0, x - padding)
@@ -173,10 +218,10 @@ def detect_with_projection(image_base64):
             'cropY': int(crop_y),
             'cropWidth': int(crop_width),
             'cropHeight': int(crop_height),
-            'rotation': round(rotation, 2),
+            'rotation': rotation,
             'originalWidth': int(original_width),
             'originalHeight': int(original_height),
-            'corners': pts.tolist()
+            'corners': ordered_pts.tolist()
         }
     
     return {
@@ -225,3 +270,4 @@ if __name__ == '__main__':
     print(" URL: http://localhost:5000")
     print("📡 Эндпоинт: POST /detect")
     app.run(host='0.0.0.0', port=5000, debug=False)
+
