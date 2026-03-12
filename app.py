@@ -153,8 +153,8 @@ def detect_document_bounds(image_base64):
 
 def detect_with_projection(image_base64):
     """
-    Улучшенный метод для детекции документов на фото.
-    Использует комбинацию пороговой обработки и поиска контуров.
+    Метод детекции угла по линиям текста (Hough Line Transform).
+    Лучше работает, когда документ сливается с фоном.
     """
     if ',' in image_base64:
         image_base64 = image_base64.split(',')[1]
@@ -170,111 +170,88 @@ def detect_with_projection(image_base64):
     # Конвертируем в оттенки серого
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Размытие для уменьшения шума
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Детекция краев Canny
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     
-    # Метод Отсу для автоматического порога
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Hough Line Transform для поиска линий
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
+                            minLineLength=100, maxLineGap=10)
     
-    # Инвертируем (документ обычно светлее фона)
-    thresh = 255 - thresh
+    # Вычисляем средний угол по всем линиям
+    angles = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            
+            # Пропускаем вертикальные линии
+            if abs(x2 - x1) < 10:
+                continue
+            
+            # Вычисляем угол линии
+            angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            
+            # Нормализуем угол (горизонтальные линии ≈ 0°)
+            if abs(angle) > 45:
+                angle = angle - 90 if angle > 0 else angle + 90
+            
+            # Пропускаем слишком большие углы
+            if abs(angle) > 30:
+                continue
+            
+            angles.append(angle)
     
-    # Морфологические операции для объединения разрывов
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(thresh, kernel, iterations=3)
-    eroded = cv2.erode(dilated, kernel, iterations=2)
+    # Если нашли линии, вычисляем средний угол
+    rotation = 0
+    if len(angles) > 0:
+        rotation = sum(angles) / len(angles)
+        rotation = round(rotation, 2)
+    
+    # Находим границы для crop (по контурам)
+    # Инвертируем (тёмный текст на светлом фоне)
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    
+    # Морфологические операции
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(binary, kernel, iterations=2)
     
     # Находим контуры
-    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Сортируем контуры по площади (убывание)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    
-    doc_contour = None
-    doc_contour_area = 0
-    
-    # Ищем контур, похожий на документ
+    # Объединяем все контуры для определения границ текста
+    all_points = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        
-        # Пропускаем слишком маленькие (< 10% изображения)
-        if area < original_width * original_height * 0.1:
-            continue
-        
-        # Аппроксимируем контур до полигона
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        
-        # Если у контура 4 угла — это документ
-        if len(approx) == 4:
-            doc_contour = approx
-            doc_contour_area = area
-            break
-        
-        # Если не нашли 4-угольник, берём наибольший подходящий контур
-        if doc_contour is None:
-            doc_contour = contour
-            doc_contour_area = area
+        if area > 500:  # Пропускаем шум
+            for point in contour:
+                all_points.append(point[0])
     
-    # Если контур найден, вычисляем параметры
-    if doc_contour is not None:
-        # Находим ограничивающий прямоугольник
-        x, y, w, h = cv2.boundingRect(doc_contour)
+    # Вычисляем границы
+    if len(all_points) > 0:
+        all_points = np.array(all_points)
+        x, y, w, h = cv2.boundingRect(all_points)
         
-        # Вычисляем угол поворота через minAreaRect
-        rect = cv2.minAreaRect(doc_contour)
-        center, size, angle = rect
-        
-        # Корректируем угол (OpenCV возвращает угол от -45 до 90)
-        if size[0] < size[1]:
-            angle = angle - 90
-        
-        # Нормализуем угол
-        rotation = -angle
-        
-        # Альтернативный расчёт угла по сторонам контура
-        if len(doc_contour) >= 4:
-            pts = doc_contour.reshape(-1, 2)
-            ordered_pts = order_points(pts)
-            
-            # Угол по верхней грани
-            edge_angle = calculate_angle(ordered_pts)
-            
-            # Используем угол, который больше по модулю (более точный)
-            if abs(edge_angle) > abs(rotation):
-                rotation = edge_angle
-        
-        # Ограничиваем угол разумными пределами
-        rotation = max(-45, min(45, rotation))
-        
-        # Добавляем padding
-        padding = 10
+        padding = 20
         crop_x = max(0, x - padding)
         crop_y = max(0, y - padding)
         crop_width = min(w + padding * 2, original_width - crop_x)
         crop_height = min(h + padding * 2, original_height - crop_y)
-        
-        return {
-            'cropX': int(crop_x),
-            'cropY': int(crop_y),
-            'cropWidth': int(crop_width),
-            'cropHeight': int(crop_height),
-            'rotation': round(rotation, 2),
-            'originalWidth': int(original_width),
-            'originalHeight': int(original_height),
-            'contourArea': int(doc_contour_area),
-            'imageArea': int(original_width * original_height)
-        }
+    else:
+        # Если текст не найден, используем всё изображение
+        crop_x = 0
+        crop_y = 0
+        crop_width = original_width
+        crop_height = original_height
     
-    # Если контур не найден — возвращаем полное изображение
     return {
-        'cropX': 0,
-        'cropY': 0,
-        'cropWidth': int(original_width),
-        'cropHeight': int(original_height),
-        'rotation': 0,
+        'cropX': int(crop_x),
+        'cropY': int(crop_y),
+        'cropWidth': int(crop_width),
+        'cropHeight': int(crop_height),
+        'rotation': rotation,
         'originalWidth': int(original_width),
-        'originalHeight': int(original_height)
+        'originalHeight': int(original_height),
+        'linesFound': len(angles),
+        'avgAngle': rotation
     }
 
 
