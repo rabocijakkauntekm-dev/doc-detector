@@ -10,6 +10,7 @@ app = Flask(__name__)
 def detect_angle_hough(image):
     """
     Определяет угол поворота по линиям текста (Hough Line Transform).
+    Возвращает угол для ПОВОРОТА изображения (противоположный угол наклона).
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
@@ -38,13 +39,15 @@ def detect_angle_hough(image):
             if abs(angle) > 45:
                 angle = angle - 90 if angle > 0 else angle + 90
             
-            # Берём только небольшие углы (документ не перевёрнут на 90°)
+            # Берём только небольшие углы
             if abs(angle) < 25:
                 angles.append(angle)
     
     # Средний угол
     if len(angles) > 0:
-        return sum(angles) / len(angles)
+        avg_angle = sum(angles) / len(angles)
+        # ИНВЕРТИРУЕМ угол для поворота изображения!
+        return -avg_angle
     
     return 0
 
@@ -55,13 +58,14 @@ def detect_text_bounds(image):
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Порог для тёмного текста
-    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    # Адаптивный порог (лучше для разного освещения)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 11, 2)
     
-    # Морфология
+    # Морфология — сначала закрываем, потом открываем
     kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(binary, kernel, iterations=3)
-    eroded = cv2.erode(dilated, kernel, iterations=2)
+    dilated = cv2.dilate(binary, kernel, iterations=4)
+    eroded = cv2.erode(dilated, kernel, iterations=3)
     
     # Контуры
     contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -70,18 +74,30 @@ def detect_text_bounds(image):
     all_points = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area > 300:  # Минимальная площадь
+        if area > 200:  # Минимальная площадь (уменьшил)
             for point in contour:
                 all_points.append(point[0])
     
+    # Если нашли текст
     if len(all_points) > 0:
         all_points = np.array(all_points)
         x, y, w, h = cv2.boundingRect(all_points)
-        return x, y, w, h
+        
+        # Добавляем небольшой отступ, но не обрезаем края
+        padding = 10
+        height, width = image.shape[:2]
+        
+        crop_x = max(0, x - padding)
+        crop_y = max(0, y - padding)
+        crop_w = min(w + padding * 2, width - crop_x)
+        crop_h = min(h + padding * 2, height - crop_y)
+        
+        return crop_x, crop_y, crop_w, crop_h
     
-    # Если текст не найден — всё изображение
+    # Если текст не найден — возвращаем всё изображение с небольшими отступами
     height, width = image.shape[:2]
-    return 0, 0, width, height
+    margin = 20
+    return margin, margin, width - margin * 2, height - margin * 2
 
 
 @app.route('/detect', methods=['POST'])
@@ -113,14 +129,7 @@ def detect():
         rotation = detect_angle_hough(image)
         
         # 2. Находим границы текста
-        x, y, w, h = detect_text_bounds(image)
-        
-        # 3. Добавляем padding
-        padding = 30
-        crop_x = max(0, x - padding)
-        crop_y = max(0, y - padding)
-        crop_w = min(w + padding * 2, original_width - crop_x)
-        crop_h = min(h + padding * 2, original_height - crop_y)
+        crop_x, crop_y, crop_w, crop_h = detect_text_bounds(image)
         
         return jsonify({
             'rotation': round(rotation, 2),
