@@ -10,7 +10,6 @@ app = Flask(__name__)
 def detect_angle_hough(image):
     """
     Определяет угол поворота по линиям текста.
-    Фильтрует шум, берёт только длинные горизонтальные линии.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
@@ -20,7 +19,7 @@ def detect_angle_hough(image):
     # Детекция краев
     edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
     
-    # Hough Lines — строгий фильтр
+    # Hough Lines
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
                             minLineLength=100, maxLineGap=10)
     
@@ -32,29 +31,23 @@ def detect_angle_hough(image):
             dx = x2 - x1
             dy = y2 - y1
             
-            # Пропускаем короткие линии
             length = math.sqrt(dx * dx + dy * dy)
             if length < 80:
                 continue
             
-            # Пропускаем вертикальные линии
             if abs(dx) < 30:
                 continue
             
             angle = math.degrees(math.atan2(dy, dx))
             
-            # Нормализуем к горизонтальным линиям
             if abs(angle) > 45:
                 angle = angle - 90 if angle > 0 else angle + 90
             
-            # Берём только небольшие углы (документ не перевёрнут)
             if abs(angle) < 30:
                 angles.append(angle)
     
-    # Средний угол
     if len(angles) > 0:
         avg_angle = sum(angles) / len(angles)
-        # ИНВЕРТИРУЕМ угол для поворота изображения
         return -avg_angle, len(angles)
     
     return 0, 0
@@ -63,62 +56,95 @@ def detect_angle_hough(image):
 def detect_text_bounds(image):
     """
     Находит границы текста на изображении.
-    Работает с белым документом на тёмном/светлом фоне.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     height, width = image.shape[:2]
     
-    # Метод 1: Инвертированный порог (тёмный текст на светлом фоне)
-    _, binary_inv = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-    
-    # Метод 2: Прямой порог (светлый документ на тёмном фоне)
-    _, binary_direct = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-    
-    # Объединяем
-    binary = cv2.bitwise_or(binary_inv, binary_direct)
+    # Адаптивный порог + Отсу
+    binary_adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                             cv2.THRESH_BINARY_INV, 11, 2)
+    _, binary_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary = cv2.bitwise_or(binary_adaptive, binary_otsu)
     
     # Морфология
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(binary, kernel, iterations=5)
-    eroded = cv2.erode(dilated, kernel, iterations=4)
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(binary, kernel, iterations=3)
+    eroded = cv2.erode(dilated, kernel, iterations=2)
     
-    # Контуры
     contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Сортируем по площади
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     
-    # Ищем контур документа (большой, но не всё изображение)
-    doc_contour = None
-    for contour in contours:
+    all_points = []
+    for contour in contours[:10]:
         area = cv2.contourArea(contour)
-        # Пропускаем слишком маленькие и слишком большие
-        if area > width * height * 0.1 and area < width * height * 0.95:
-            doc_contour = contour
-            break
+        if area > 500 and area < width * height * 0.9:
+            for point in contour:
+                all_points.append(point[0])
     
-    # Если нашли контур документа
-    if doc_contour is not None:
-        x, y, w, h = cv2.boundingRect(doc_contour)
+    if len(all_points) > 0:
+        all_points = np.array(all_points)
+        x, y, w, h = cv2.boundingRect(all_points)
         
-        padding = 20
+        padding = 30
         crop_x = max(0, x - padding)
         crop_y = max(0, y - padding)
         crop_w = min(w + padding * 2, width - crop_x)
         crop_h = min(h + padding * 2, height - crop_y)
         
-        return crop_x, crop_y, crop_w, crop_h, len(contours), 'contour'
+        return crop_x, crop_y, crop_w, crop_h, len(contours), 'text'
     
-    # Если не нашли — используем центр изображения (80%)
-    margin_x = int(width * 0.1)
-    margin_y = int(height * 0.1)
-    return margin_x, margin_y, width - margin_x * 2, height - margin_y * 2, len(contours), 'center'
+    # Если текст не найден — ищем контур документа
+    _, binary_inv = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+    
+    kernel = np.ones((5, 5), np.uint8)
+    dilated = cv2.dilate(binary_inv, kernel, iterations=5)
+    eroded = cv2.erode(dilated, kernel, iterations=4)
+    
+    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > width * height * 0.1 and area < width * height * 0.95:
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            padding = 20
+            crop_x = max(0, x - padding)
+            crop_y = max(0, y - padding)
+            crop_w = min(w + padding * 2, width - crop_x)
+            crop_h = min(h + padding * 2, height - crop_y)
+            
+            return crop_x, crop_y, crop_w, crop_h, len(contours), 'document'
+    
+    margin_x = int(width * 0.05)
+    margin_y = int(height * 0.05)
+    return margin_x, margin_y, width - margin_x * 2, height - margin_y * 2, 0, 'center'
+
+
+def rotate_and_crop(image, angle, crop_x, crop_y, crop_w, crop_h):
+    """
+    Поворачивает изображение и обрезает по координатам.
+    Сначала поворот, потом crop по новым координатам.
+    """
+    height, width = image.shape[:2]
+    center = (width / 2, height / 2)
+    
+    # Поворот изображения
+    rotated = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated_image = cv2.warpAffine(image, rotated, (width, height), 
+                                    borderMode=cv2.BORDER_REPLICATE)
+    
+    # Обрезка
+    cropped = rotated_image[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+    
+    return cropped
 
 
 @app.route('/detect', methods=['POST'])
 def detect():
     """
     API для детекции угла и границ документа.
+    Возвращает координаты + готовое обработанное изображение!
     """
     try:
         data = request.get_json()
@@ -128,7 +154,6 @@ def detect():
         
         image_base64 = data['imageBase64']
         
-        # Декодируем
         if ',' in image_base64:
             image_base64 = image_base64.split(',')[1]
         
@@ -140,11 +165,18 @@ def detect():
         
         original_height, original_width = image.shape[:2]
         
-        # 1. Определяем угол по линиям текста
+        # 1. Определяем угол
         rotation, lines_count = detect_angle_hough(image)
         
-        # 2. Находим границы текста
+        # 2. Находим границы
         crop_x, crop_y, crop_w, crop_h, contours_count, method = detect_text_bounds(image)
+        
+        # 3. Поворачиваем и обрезаем на сервере!
+        processed_image = rotate_and_crop(image, rotation, crop_x, crop_y, crop_w, crop_h)
+        
+        # 4. Кодируем результат в base64
+        _, buffer = cv2.imencode('.jpg', processed_image)
+        processed_base64 = base64.b64encode(buffer).decode('utf-8')
         
         return jsonify({
             'rotation': round(rotation, 2),
@@ -154,8 +186,8 @@ def detect():
             'cropHeight': int(crop_h),
             'originalWidth': int(original_width),
             'originalHeight': int(original_height),
-            'debug': f'Линий: {lines_count}, Контуров: {contours_count}, Метод: {method}, Угол: {round(rotation, 2)}°',
-            'bounds': f'{crop_x},{crop_y},{crop_w},{crop_h}'
+            'processedImage': f'data:image/jpeg;base64,{processed_base64}',
+            'debug': f'Линий: {lines_count}, Контуров: {contours_count}, Метод: {method}, Угол: {round(rotation, 2)}°'
         })
     
     except Exception as e:
