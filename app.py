@@ -153,7 +153,8 @@ def detect_document_bounds(image_base64):
 
 def detect_with_projection(image_base64):
     """
-    Более точный метод с перспективной трансформацией.
+    Улучшенный метод для детекции документов на фото.
+    Использует комбинацию пороговой обработки и поиска контуров.
     """
     if ',' in image_base64:
         image_base64 = image_base64.split(',')[1]
@@ -169,44 +170,84 @@ def detect_with_projection(image_base64):
     # Конвертируем в оттенки серого
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Адаптивная бинаризация (лучше для документов)
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                    cv2.THRESH_BINARY, 11, 2)
+    # Размытие для уменьшения шума
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     
-    # Размытие
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Метод Отсу для автоматического порога
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # Детекция краев
-    edges = cv2.Canny(blurred, 75, 200)
+    # Инвертируем (документ обычно светлее фона)
+    thresh = 255 - thresh
     
-    # Морфологические операции
-    kernel = np.ones((3, 3), np.uint8)
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Морфологические операции для объединения разрывов
+    kernel = np.ones((5, 5), np.uint8)
+    dilated = cv2.dilate(thresh, kernel, iterations=3)
+    eroded = cv2.erode(dilated, kernel, iterations=2)
     
     # Находим контуры
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Сортируем контуры по площади (убывание)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     
     doc_contour = None
+    doc_contour_area = 0
+    
+    # Ищем контур, похожий на документ
     for contour in contours:
+        area = cv2.contourArea(contour)
+        
+        # Пропускаем слишком маленькие (< 10% изображения)
+        if area < original_width * original_height * 0.1:
+            continue
+        
+        # Аппроксимируем контур до полигона
         epsilon = 0.02 * cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, epsilon, True)
         
+        # Если у контура 4 угла — это документ
         if len(approx) == 4:
             doc_contour = approx
+            doc_contour_area = area
             break
-    
-    if doc_contour is not None:
-        # Сортируем точки правильно
-        pts = doc_contour.reshape(4, 2)
-        ordered_pts = order_points(pts)
         
+        # Если не нашли 4-угольник, берём наибольший подходящий контур
+        if doc_contour is None:
+            doc_contour = contour
+            doc_contour_area = area
+    
+    # Если контур найден, вычисляем параметры
+    if doc_contour is not None:
         # Находим ограничивающий прямоугольник
         x, y, w, h = cv2.boundingRect(doc_contour)
         
-        # Вычисляем угол поворота по верхней грани
-        rotation = calculate_angle(ordered_pts)
+        # Вычисляем угол поворота через minAreaRect
+        rect = cv2.minAreaRect(doc_contour)
+        center, size, angle = rect
         
+        # Корректируем угол (OpenCV возвращает угол от -45 до 90)
+        if size[0] < size[1]:
+            angle = angle - 90
+        
+        # Нормализуем угол
+        rotation = -angle
+        
+        # Альтернативный расчёт угла по сторонам контура
+        if len(doc_contour) >= 4:
+            pts = doc_contour.reshape(-1, 2)
+            ordered_pts = order_points(pts)
+            
+            # Угол по верхней грани
+            edge_angle = calculate_angle(ordered_pts)
+            
+            # Используем угол, который больше по модулю (более точный)
+            if abs(edge_angle) > abs(rotation):
+                rotation = edge_angle
+        
+        # Ограничиваем угол разумными пределами
+        rotation = max(-45, min(45, rotation))
+        
+        # Добавляем padding
         padding = 10
         crop_x = max(0, x - padding)
         crop_y = max(0, y - padding)
@@ -218,12 +259,14 @@ def detect_with_projection(image_base64):
             'cropY': int(crop_y),
             'cropWidth': int(crop_width),
             'cropHeight': int(crop_height),
-            'rotation': rotation,
+            'rotation': round(rotation, 2),
             'originalWidth': int(original_width),
             'originalHeight': int(original_height),
-            'corners': ordered_pts.tolist()
+            'contourArea': int(doc_contour_area),
+            'imageArea': int(original_width * original_height)
         }
     
+    # Если контур не найден — возвращаем полное изображение
     return {
         'cropX': 0,
         'cropY': 0,
